@@ -1490,9 +1490,11 @@ static int evict_process_queues_cpsch(struct device_queue_manager *dqm,
 	/*
 	 * Heavy-weight TLB flush after MES removes queues to ensure
 	 * in-flight memory accesses complete before memory is freed/migrated.
-	 * HWS does this automatically, MES does not.
+	 * HWS does this automatically, MES does not. Every device of the
+	 * process is evicted, including any it never acquired a VM on, which
+	 * has no drm_priv and nothing mapped to flush.
 	 */
-	if (dqm->dev->kfd->shared_resources.enable_mes)
+	if (dqm->dev->kfd->shared_resources.enable_mes && pdd->drm_priv)
 		kfd_flush_tlb(pdd);
 
 	if (!dqm->dev->kfd->shared_resources.enable_mes) {
@@ -3790,7 +3792,7 @@ int suspend_queues(struct kfd_process *p,
 		struct device *dev = dqm->dev->adev->dev;
 		struct qcm_process_device *qpd = &pdd->qpd;
 		struct queue *q;
-		int r, per_device_suspended = 0;
+		int r, per_device_suspended = 0, per_device_mes_suspended = 0;
 
 		mutex_lock(&p->event_mutex);
 		dqm_lock(dqm);
@@ -3811,10 +3813,12 @@ int suspend_queues(struct kfd_process *p,
 						q->properties.exception_status &=
 							~exception_clear_mask;
 
-					if (is_mes)
+					if (is_mes) {
 						total_suspended++;
-					else
+						per_device_mes_suspended++;
+					} else {
 						per_device_suspended++;
+					}
 				} else if (err != -EBUSY) {
 					queue_ids[q_idx] |= KFD_DBG_QUEUE_ERROR_MASK;
 					break;
@@ -3825,11 +3829,18 @@ int suspend_queues(struct kfd_process *p,
 		if (!per_device_suspended) {
 			dqm_unlock(dqm);
 			mutex_unlock(&p->event_mutex);
-			if (total_suspended) {
+			if (total_suspended)
 				amdgpu_amdkfd_debug_mem_fence(dqm->dev->adev);
-				/* Heavy-weight TLB flush after MES suspends queues */
+			/*
+			 * Heavy-weight TLB flush after MES suspends queues, for
+			 * this device only. total_suspended counts every device
+			 * so far, so it cannot gate this: on a multi-GPU host it
+			 * reached devices with no suspended queues, including
+			 * ones the process never acquired a VM on, whose NULL
+			 * drm_priv kfd_flush_tlb() then dereferenced.
+			 */
+			if (per_device_mes_suspended && pdd->drm_priv)
 				kfd_flush_tlb(pdd);
-			}
 			continue;
 		}
 
