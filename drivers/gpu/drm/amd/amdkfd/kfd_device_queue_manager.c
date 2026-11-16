@@ -2606,12 +2606,47 @@ reset_fail:
 	return r;
 }
 
+/*
+ * Whether an SDMA queue is still on its hardware slot after an unmap, which
+ * means its preemption failed.
+ *
+ * By default every slot of every engine is read. Under SR-IOV each read goes
+ * through the KIQ, about 40 us apiece, and a device has on the order of a
+ * hundred slots: measured on an MI355X VF, 5.5 ms of every 5.9 ms unmap went
+ * here, which made the debugger's queue suspend/resume, issued many times a
+ * second by a time-slicing scheduler, cost 10 ms and more each.
+ *
+ * The debugger's suspend and resume paths set sdma_hang_check_listed_only
+ * around their unmap. They neither destroy queues nor remove processes, so
+ * every queue that can be on a slot is on a process's queue list, and reading
+ * only those slots finds what the full scan would. Paths that do remove queues
+ * from the lists before unmapping (queue destruction frees the slot first,
+ * process termination unlinks the process first) keep the full scan.
+ */
 static bool sdma_has_hang(struct device_queue_manager *dqm)
 {
 	int engine_start = dqm->dev->node_id * get_num_all_sdma_engines(dqm);
 	int engine_end = engine_start + get_num_all_sdma_engines(dqm);
 	int num_queues_per_eng =  dqm->dev->kfd->device_info.num_sdma_queues_per_engine;
 	int i, j;
+
+	if (dqm->sdma_hang_check_listed_only) {
+		struct device_process_node *cur;
+		struct queue *q;
+
+		list_for_each_entry(cur, &dqm->queues, list) {
+			list_for_each_entry(q, &cur->qpd->queues_list, list) {
+				if (q->properties.type != KFD_QUEUE_TYPE_SDMA &&
+				    q->properties.type != KFD_QUEUE_TYPE_SDMA_XGMI)
+					continue;
+				if (dqm->dev->kfd2kgd->hqd_sdma_get_doorbell(dqm->dev->adev,
+						engine_start + q->properties.sdma_engine_id,
+						q->properties.sdma_queue_id))
+					return true;
+			}
+		}
+		return false;
+	}
 
 	for (i = engine_start; i < engine_end; i++) {
 		for (j = 0; j < num_queues_per_eng; j++) {
@@ -3732,10 +3767,12 @@ int resume_queues(struct kfd_process *p,
 			continue;
 		}
 
+		dqm->sdma_hang_check_listed_only = true;
 		r = execute_queues_cpsch(dqm,
 					KFD_UNMAP_QUEUES_FILTER_DYNAMIC_QUEUES,
 					0,
 					USE_DEFAULT_GRACE_PERIOD);
+		dqm->sdma_hang_check_listed_only = false;
 		if (r) {
 			dev_err(dev, "Failed to resume process queues\n");
 			if (queue_ids) {
@@ -3844,9 +3881,11 @@ int suspend_queues(struct kfd_process *p,
 			continue;
 		}
 
+		dqm->sdma_hang_check_listed_only = true;
 		r = execute_queues_cpsch(dqm,
 			KFD_UNMAP_QUEUES_FILTER_DYNAMIC_QUEUES, 0,
 			grace_period);
+		dqm->sdma_hang_check_listed_only = false;
 
 		if (r)
 			dev_err(dev, "Failed to suspend process queues.\n");

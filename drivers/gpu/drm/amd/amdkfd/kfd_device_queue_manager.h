@@ -270,6 +270,11 @@ struct device_queue_manager {
 
 	/* hw exception  */
 	bool			is_hws_hang;
+	/* Set by the debugger's suspend/resume paths while they unmap, so that
+	 * sdma_has_hang() checks only the slots of listed SDMA queues; see there.
+	 * Protected by the dqm lock.
+	 */
+	bool			sdma_hang_check_listed_only;
 	bool			is_resetting;
 	struct kfd_mem_obj	hiq_sdma_mqd;
 	bool			sched_running;
